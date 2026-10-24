@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using MediaBrowser.Common.Configuration;
@@ -27,8 +28,9 @@ namespace Baklava.Api
         {
             // Check if request is for the web interface index
             var path = context.Request.Path.Value;
-            bool isIndexRequest = path.Equals("/web/index.html", StringComparison.OrdinalIgnoreCase) ||
-                                  path.Equals("/web/", StringComparison.OrdinalIgnoreCase);
+            bool isIndexRequest = (HttpMethods.IsGet(context.Request.Method) || HttpMethods.IsHead(context.Request.Method)) &&
+                                  (path?.EndsWith("/web/index.html", StringComparison.OrdinalIgnoreCase) == true ||
+                                   path?.EndsWith("/web/", StringComparison.OrdinalIgnoreCase) == true);
 
             // If it is an index request AND injection is enabled
             if (isIndexRequest && (Plugin.Instance?.Configuration?.EnableBaklavaUI ?? true))
@@ -50,7 +52,9 @@ namespace Baklava.Api
                             
                             context.Response.ContentType = "text/html; charset=utf-8";
                             context.Response.StatusCode = 200;
-                            await context.Response.WriteAsync(modifiedHtml, Encoding.UTF8);
+                            context.Response.Headers.CacheControl = "no-store";
+                            if (!HttpMethods.IsHead(context.Request.Method))
+                                await context.Response.WriteAsync(modifiedHtml, Encoding.UTF8, context.RequestAborted);
                             return; // Short-circuit: do not call _next
                         }
                     }
@@ -89,11 +93,13 @@ namespace Baklava.Api
             if (config != null)
             {
                 sb.AppendLine("<script id=\"baklava-config\">");
-                sb.AppendLine("window.BaklavaConfig = {");
-                sb.AppendLine($"    versionUi: '{config.VersionUi ?? "carousel"}',");
-                sb.AppendLine($"    audioUi: '{config.AudioUi ?? "carousel"}',");
-                sb.AppendLine($"    subtitleUi: '{config.SubtitleUi ?? "carousel"}'");
-                sb.AppendLine("};");
+                sb.Append("window.BaklavaConfig = ");
+                sb.Append(JsonSerializer.Serialize(new {
+                    versionUi = config.VersionUi ?? "carousel",
+                    audioUi = config.AudioUi ?? "carousel",
+                    subtitleUi = config.SubtitleUi ?? "carousel"
+                }));
+                sb.AppendLine(";");
                 sb.AppendLine("</script>");
             }
 

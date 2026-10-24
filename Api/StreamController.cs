@@ -3,18 +3,21 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Threading;
+using System.Security.Claims;
 using System.Threading.Tasks;
 using Baklava.Services;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
 
 namespace Baklava.Api
 {
     [ApiController]
+    [Authorize]
     [Route("api/baklava/metadata")]
     [Produces("application/json")]
     public class StreamController : ControllerBase
@@ -23,6 +26,7 @@ namespace Baklava.Api
         private readonly StreamService _streamService;
         private readonly SubtitleService _subtitleService;
         private readonly ILibraryManager _libraryManager;
+        private readonly IUserManager _userManager;
         private readonly IMediaSourceManager _mediaSourceManager;
 
         public StreamController(
@@ -30,12 +34,14 @@ namespace Baklava.Api
             StreamService streamService,
             SubtitleService subtitleService,
             ILibraryManager libraryManager,
+            IUserManager userManager,
             IMediaSourceManager mediaSourceManager)
         {
             _logger = logger;
             _streamService = streamService;
             _subtitleService = subtitleService;
             _libraryManager = libraryManager;
+            _userManager = userManager;
             _mediaSourceManager = mediaSourceManager;
         }
 
@@ -48,13 +54,33 @@ namespace Baklava.Api
             bool isWebClient = string.Equals(client, "web", StringComparison.OrdinalIgnoreCase);
             if (string.IsNullOrEmpty(itemId) || !Guid.TryParse(itemId, out var itemGuid)) return BadRequest(new { error = "Invalid itemId" });
 
-            var item = _libraryManager.GetItemById(itemGuid);
+            var actorIdValues = new[]
+            {
+                User.FindFirst("UserId")?.Value,
+                User.FindFirst("Jellyfin-UserId")?.Value,
+                User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+            };
+            var actorId = Guid.Empty;
+            if (!actorIdValues.Any(value => Guid.TryParse(value, out actorId) && actorId != Guid.Empty))
+            {
+                _logger.LogWarning("[Baklava.Stream] Authenticated principal did not contain a valid Jellyfin user ID");
+                return Forbid();
+            }
+
+            var actor = _userManager.GetUserById(actorId);
+            if (actor == null)
+            {
+                _logger.LogWarning("[Baklava.Stream] Authenticated Jellyfin user {UserId} was not found", actorId);
+                return Forbid();
+            }
+
+            var item = _libraryManager.GetItemById<BaseItem>(itemGuid, actor);
             if (item == null) return NotFound(new { error = "Item not found" });
 
             // 1. Resolve Target Source
             bool explicitRequest = !string.IsNullOrEmpty(mediaSourceId);
 
-            var mediaSourceResult = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, true, CancellationToken.None);
+            var mediaSourceResult = await _mediaSourceManager.GetPlaybackMediaSources(item, actor, true, true, HttpContext.RequestAborted);
             var mediaSources = mediaSourceResult.ToList();
             if (mediaSources.Count == 0) return NotFound(new { error = "No media sources" });
 

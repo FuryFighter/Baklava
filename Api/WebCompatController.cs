@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Baklava.Services;
+using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
@@ -15,6 +16,7 @@ using Microsoft.Extensions.Logging;
 namespace Baklava.Api
 {
     [ApiController]
+    [Authorize(Policy = Policies.RequiresElevation)]
     [Route("api/baklava/webcompat")]
     public class WebCompatController : ControllerBase
     {
@@ -57,7 +59,6 @@ namespace Baklava.Api
         /// GET /api/baklava/webcompat/versions/{itemId}
         /// </summary>
         [HttpGet("versions/{itemId}")]
-        [AllowAnonymous]
         public async Task<IActionResult> GetWebCompatibleVersions(string itemId, [FromQuery] bool filterWebOnly = false)
         {
             try
@@ -203,7 +204,6 @@ namespace Baklava.Api
         /// POST /api/baklava/webcompat/analyze/{itemId}
         /// </summary>
         [HttpPost("analyze/{itemId}")]
-        [AllowAnonymous]
         public async Task<IActionResult> AnalyzeStreams(string itemId)
         {
             try
@@ -296,7 +296,6 @@ namespace Baklava.Api
         /// GET /api/baklava/webcompat/streams/{itemId}
         /// </summary>
         [HttpGet("streams/{itemId}")]
-        [AllowAnonymous]
         public async Task<IActionResult> GetCompatibleStreams(string itemId)
         {
             try

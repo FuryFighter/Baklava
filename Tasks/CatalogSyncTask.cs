@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Baklava.Helpers;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Collections;
 using MediaBrowser.Controller.Entities;
@@ -349,7 +350,7 @@ namespace Baklava.Tasks
 
                         if (libraryItem == null)
                         {
-                            var importedIdStr = await ImportItemViaReflection(imdbId, mediaType).ConfigureAwait(false);
+                            var importedIdStr = await ImportItemViaReflection(imdbId, mediaType, ct).ConfigureAwait(false);
                             
                             if (!string.IsNullOrEmpty(importedIdStr) && Guid.TryParse(importedIdStr, out var newGuid))
                             {
@@ -406,7 +407,7 @@ namespace Baklava.Tasks
 
                         if (libraryItem == null)
                         {
-                            var importedIdStr = await ImportItemViaReflection(imdbId, mediaType).ConfigureAwait(false);
+                            var importedIdStr = await ImportItemViaReflection(imdbId, mediaType, token).ConfigureAwait(false);
                             
                             if (!string.IsNullOrEmpty(importedIdStr) && Guid.TryParse(importedIdStr, out var newGuid))
                             {
@@ -447,248 +448,60 @@ namespace Baklava.Tasks
             _logger.LogInformation("[Baklava] Import complete. Success: {Success}, Failed: {Failed}", importedIds.Count, failed);
         }
 
-        private async Task<string?> ImportItemViaReflection(string imdbId, string type)
+        private async Task<string?> ImportItemViaReflection(
+            string imdbId,
+            string type,
+            CancellationToken cancellationToken)
         {
             try
             {
-                // Resolve Gelato Assemblies and Types
-                var gelatoAssembly = AppDomain.CurrentDomain.GetAssemblies()
-                    .FirstOrDefault(a => a.GetName().Name == "Gelato");
-                
-                if (gelatoAssembly == null)
+                var gelatoAssembly = GelatoCompatibility.GetAssembly();
+                if (gelatoAssembly is null)
                 {
                     _logger.LogError("[Baklava] Gelato assembly not found");
                     return null;
                 }
 
-                var managerType = gelatoAssembly.GetType("Gelato.GelatoManager");
-                var pluginType = gelatoAssembly.GetType("Gelato.GelatoPlugin");
-                var metaTypeEnum = gelatoAssembly.GetType("Gelato.StremioMediaType");
-                
-                if (managerType == null || pluginType == null || metaTypeEnum == null)
-                {
-                    _logger.LogError("[Baklava] Required Gelato types not found");
-                    return null;
-                }
-                
-                // Get Singleton Manager Instance (to steal dependencies from)
                 using var scope = _scopeFactory.CreateScope();
-                var singletonManager = scope.ServiceProvider.GetService(managerType);
-                if (singletonManager == null)
+                var manager = GelatoCompatibility.GetManager(scope.ServiceProvider, gelatoAssembly);
+                var mediaType = GelatoCompatibility.GetMediaType(gelatoAssembly);
+                if (manager is null || mediaType is null)
                 {
-                    _logger.LogError("[Baklava] GelatoManager service not found");
+                    _logger.LogError("[Baklava] Gelato manager or media type not available");
                     return null;
                 }
 
-                // --- FRANKENSTEIN START ---
-                // Create Transient GelatoManager using manual constructor injection
-                // We steal singletons from the existing manager and inject FRESH scoped services (Repository/Library)
-                
-                object managerToUse = singletonManager;
-                object? transientManager = null;
-
-                try 
-                {
-                    var ctors = managerType.GetConstructors();
-                    var ctor = ctors.FirstOrDefault(); 
-
-                    if (ctor != null)
-                    {
-                        var args = new List<object>();
-                        var parameters = ctor.GetParameters();
-
-                        foreach (var param in parameters)
-                        {
-                            object? arg = null;
-                            var paramType = param.ParameterType;
-
-                            // 1. Inject FRESH scoped dependencies
-                            if (paramType.Name.Contains("IItemRepository") || paramType.Name.Contains("GelatoItemRepository") || 
-                                paramType.Name.Contains("ILibraryManager") || paramType.Name.Contains("ICollectionManager"))
-                            {
-                                 // Special handling for GelatoItemRepository to ensure fresh inner repo
-                                 if (paramType.Name.Contains("GelatoItemRepository"))
-                                 {
-                                     try 
-                                     {
-                                         var innerRepo = scope.ServiceProvider.GetService(typeof(MediaBrowser.Controller.Persistence.IItemRepository));
-                                         if (innerRepo != null)
-                                         {
-                                             var repoCtors = paramType.GetConstructors();
-                                             foreach (var rCtor in repoCtors)
-                                             {
-                                                 var rParams = rCtor.GetParameters();
-                                                 var rArgs = new List<object>();
-                                                 bool canSatisfy = true;
-                                                 foreach(var rp in rParams)
-                                                 {
-                                                     if (rp.ParameterType.IsInstanceOfType(innerRepo))
-                                                         rArgs.Add(innerRepo);
-                                                     else 
-                                                     {
-                                                         var pService = scope.ServiceProvider.GetService(rp.ParameterType);
-                                                         if (pService != null) rArgs.Add(pService);
-                                                         else { canSatisfy = false; break; }
-                                                     }
-                                                 }
-                                                 if (canSatisfy) { arg = rCtor.Invoke(rArgs.ToArray()); break; }
-                                             }
-                                         }
-                                     }
-                                     catch (Exception ex) { _logger.LogWarning("[Baklava] Failed to manually construct GelatoItemRepository in SyncTask: {Msg}", ex.Message); }
-                                 }
-
-                                if (arg == null)
-                                {
-                                    var resolveType = paramType.Name.Contains("GelatoItemRepository") 
-                                        ? typeof(MediaBrowser.Controller.Persistence.IItemRepository) 
-                                        : paramType;
-
-                                    arg = scope.ServiceProvider.GetService(resolveType);
-                                }
-                            }
-
-                            // 2. Steal from Singleton if not resolved
-                            if (arg == null)
-                            {
-                                var fieldName = "_" + param.Name;
-                                var field = managerType.GetField(fieldName, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
-                                
-                                if (field == null)
-                                    field = managerType.GetField(param.Name, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
-                                
-                                if (field != null)
-                                    arg = field.GetValue(singletonManager);
-                            }
-
-                            // 3. Fallback resolve
-                            if (arg == null)
-                                arg = scope.ServiceProvider.GetService(paramType);
-
-                            args.Add(arg!);
-                        }
-
-                        if (args.Count == parameters.Length)
-                        {
-                            transientManager = ctor.Invoke(args.ToArray());
-                            _logger.LogDebug("[Baklava] Frankenstein Transient GelatoManager created for SyncTask.");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "[Baklava] Failed to create transient GelatoManager in SyncTask, using singleton.");
-                }
-
-                if (transientManager != null) managerToUse = transientManager;
-                // --- FRANKENSTEIN END ---
-
-                object metaResult = null;
-
-                 // 1. Try to Fetch Full Metadata via StremioProvider
-                try 
-                {
-                    object pluginInstance = null;
-                    var instanceProp = pluginType.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                    if (instanceProp != null) pluginInstance = instanceProp.GetValue(null);
-
-                    if (pluginInstance != null)
-                    {
-                        var getConfigMethod = pluginType.GetMethod("GetConfig");
-                        if (getConfigMethod != null)
-                        {
-                            var config = getConfigMethod.Invoke(pluginInstance, new object[] { Guid.Empty });
-                            if (config != null)
-                            {
-                                var stremioField = config.GetType().GetField("stremio");
-                                var stremioProvider = stremioField?.GetValue(config);
-                                
-                                if (stremioProvider != null)
-                                {
-                                    var metaTypeValForFetch = Enum.Parse(metaTypeEnum, type.Equals("tv", StringComparison.OrdinalIgnoreCase) ? "Series" : "Movie", true);
-                                    var getMetaMethod = stremioProvider.GetType().GetMethod("GetMetaAsync", new[] { typeof(string), metaTypeEnum });
-                                    
-                                    if (getMetaMethod != null)
-                                    {
-                                        var task = (Task)getMetaMethod.Invoke(stremioProvider, new object[] { imdbId, metaTypeValForFetch });
-                                        await task.ConfigureAwait(false);
-                                        
-                                        var resultProp = task.GetType().GetProperty("Result");
-                                        metaResult = resultProp?.GetValue(task);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning("[Baklava] Failed to fetch full meta for {Id} in SyncTask: {Msg}", imdbId, ex.Message);
-                }
-
-                // 2. Fallback: Create stub StremioMeta object
-                if (metaResult == null)
-                {
-                     var stremioMetaType = gelatoAssembly.GetType("Gelato.StremioMeta");
-                    if (stremioMetaType == null) return null;
-                    
-                    metaResult = Activator.CreateInstance(stremioMetaType);
-                    if (metaResult == null) return null;
-
-                    // Set ID and ImdbId
-                    stremioMetaType.GetProperty("Id")?.SetValue(metaResult, imdbId);
-                    stremioMetaType.GetProperty("ImdbId")?.SetValue(metaResult, imdbId);
-                    
-                    // Set Type
-                    var metaTypeVal = Enum.Parse(metaTypeEnum, type.Equals("tv", StringComparison.OrdinalIgnoreCase) ? "Series" : "Movie", true);
-                    stremioMetaType.GetProperty("Type")?.SetValue(metaResult, metaTypeVal);
-                    
-                    if (type.Equals("tv", StringComparison.OrdinalIgnoreCase))
-                    {
-                        stremioMetaType.GetProperty("Videos")?.SetValue(metaResult, null);
-                    }
-                }
-
-                // Determine Parent Folder
                 var isSeries = type.Equals("tv", StringComparison.OrdinalIgnoreCase);
-                var folderMethodName = isSeries ? "TryGetSeriesFolder" : "TryGetMovieFolder";
-                var getFolderMethod = managerType.GetMethod(folderMethodName, new Type[] { typeof(Guid) });
-                
-                var parentFolder = getFolderMethod?.Invoke(managerToUse, new object[] { Guid.Empty });
-                if (parentFolder == null)
+                var mediaTypeValue = GelatoCompatibility.ParseMediaType(mediaType, isSeries);
+                var config = GelatoCompatibility.GetConfig(gelatoAssembly, Guid.Empty);
+                var provider = config is null ? null : GelatoCompatibility.GetStremioProvider(config);
+                var meta = provider is null
+                    ? null
+                    : await GelatoCompatibility.GetMetaAsync(provider, imdbId, mediaTypeValue)
+                        .ConfigureAwait(false);
+                meta ??= GelatoCompatibility.CreateMeta(gelatoAssembly, imdbId, mediaTypeValue);
+
+                var parentFolder = GelatoCompatibility.GetRootFolder(manager, isSeries, Guid.Empty);
+                if (parentFolder is null)
                 {
                     _logger.LogError("[Baklava] Root folder not found for {Type}", type);
                     return null;
                 }
 
-                // Insert Meta
-                var insertMetaMethod = managerType.GetMethod("InsertMeta");
-                if (insertMetaMethod == null) return null;
-                
-                var insertTask = (Task)insertMetaMethod.Invoke(managerToUse, new object[] {
+                var insertedItem = await GelatoCompatibility.InsertMetaAsync(
+                    manager,
                     parentFolder,
-                    metaResult,
-                    Guid.Empty, // userId
-                    true, // allowRemoteRefresh (Enabled for initial fetch)
-                    true, // refreshItem
-                    false, // queueRefreshItem
-                    System.Threading.CancellationToken.None
-                })!;
-                
-                await insertTask.ConfigureAwait(false);
-                
-                // Return Item.Id
-                var resultTuple = insertTask.GetType().GetProperty("Result")?.GetValue(insertTask);
-                var itemField = resultTuple?.GetType().GetField("Item1"); 
-                var item = itemField?.GetValue(resultTuple);
-                
-                if (item != null)
-                {
-                    var idProp = item.GetType().GetProperty("Id");
-                    return idProp?.GetValue(item)?.ToString();
-                }
-
-                return null;
+                    meta,
+                    user: null,
+                    allowRemoteRefresh: true,
+                    refreshItem: true,
+                    queueRefreshItem: false,
+                    cancellationToken).ConfigureAwait(false);
+                return GelatoCompatibility.GetItemId(insertedItem);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {

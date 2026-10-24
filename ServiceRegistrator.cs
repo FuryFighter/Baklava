@@ -15,6 +15,8 @@ namespace Baklava
         {
             // Register the SearchActionFilter as a singleton
             services.AddSingleton<SearchActionFilter>();
+            services.Configure<Microsoft.AspNetCore.Mvc.MvcOptions>(options =>
+                options.Filters.AddService<SearchActionFilter>());
 
             // Register IStartupFilter to inject UI middleware
             services.AddTransient<Microsoft.AspNetCore.Hosting.IStartupFilter, Baklava.Api.UIInjectionStartupFilter>();
@@ -26,6 +28,7 @@ namespace Baklava
 
             services.AddSingleton<StreamService>();
             services.AddSingleton<SubtitleService>();
+            services.AddSingleton<RequestImportService>();
 
             // Register Scheduled Tasks
             services.AddSingleton<MediaBrowser.Model.Tasks.IScheduledTask, Baklava.Tasks.CatalogSyncTask>();

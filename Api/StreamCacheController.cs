@@ -5,7 +5,9 @@ using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Baklava.Helpers;
 using Baklava.Services;
+using MediaBrowser.Common.Api;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -18,7 +20,7 @@ namespace Baklava.Api
     [ApiController]
     [Route("api/baklava/streams")]
     [Produces("application/json")]
-    [Authorize]
+    [Authorize(Policy = Policies.RequiresElevation)]
     public class StreamCacheController : ControllerBase
     {
         private readonly ILogger<StreamCacheController> _logger;
@@ -643,30 +645,12 @@ namespace Baklava.Api
         /// </summary>
         private async Task<List<StreamInfo>> FetchStreamsFromGelatoProvider(CacheStreamsRequest request)
         {
-            // Try to get Gelato plugin directly from its static Instance property
-            var gelatoAssembly = AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(a => a.GetName().Name == "Gelato");
+            var gelatoAssembly = GelatoCompatibility.GetAssembly();
 
             if (gelatoAssembly == null)
             {
                 _logger.LogError("[StreamCache] Gelato assembly not found");
                 throw new InvalidOperationException("Gelato assembly not found");
-            }
-
-            var gelatoPluginType = gelatoAssembly.GetType("Gelato.GelatoPlugin");
-            if (gelatoPluginType == null)
-            {
-                _logger.LogError("[StreamCache] GelatoPlugin type not found");
-                throw new InvalidOperationException("GelatoPlugin type not found");
-            }
-
-            var gelatoInstanceProperty = gelatoPluginType.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-            var gelatoInstance = gelatoInstanceProperty?.GetValue(null);
-
-            if (gelatoInstance == null)
-            {
-                _logger.LogError("[StreamCache] Gelato instance not found");
-                throw new InvalidOperationException("Gelato instance not found");
             }
 
             // Get user ID (use request.UserId or default)
@@ -676,32 +660,14 @@ namespace Baklava.Api
                 Guid.TryParse(request.UserId, out userId);
             }
 
-            // Get config method
-            var getConfigMethod = gelatoInstance.GetType().GetMethod("GetConfig");
-            if (getConfigMethod == null)
-            {
-                _logger.LogError("[StreamCache] GetConfig method not found");
-                throw new InvalidOperationException("GetConfig method not found in Gelato");
-            }
-
-            var config = getConfigMethod.Invoke(gelatoInstance, new object[] { userId });
+            var config = GelatoCompatibility.GetConfig(gelatoAssembly, userId);
             if (config == null)
             {
                 _logger.LogError("[StreamCache] Gelato config is null");
                 throw new InvalidOperationException("Gelato config is null");
             }
 
-            _logger.LogInformation("[StreamCache] Got Gelato config, checking for stremio field");
-
-            // Get stremio provider from config (it's a field, not a property)
-            var stremioField = config.GetType().GetField("stremio", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-            if (stremioField == null)
-            {
-                _logger.LogError("[StreamCache] Stremio field not found in config");
-                throw new InvalidOperationException("Stremio field not found");
-            }
-
-            var stremioProvider = stremioField.GetValue(config);
+            var stremioProvider = GelatoCompatibility.GetStremioProvider(config);
 
             if (stremioProvider == null)
             {
@@ -717,33 +683,19 @@ namespace Baklava.Api
 
             _logger.LogInformation("[StreamCache] Fetching streams from Gelato provider for {MediaType}/{Id}", mediaType, stremioId);
 
-            // Determine StremioMediaType enum value
-            var stremioMediaTypeEnum = gelatoAssembly.GetType("Gelato.StremioMediaType");
+            var stremioMediaTypeEnum = GelatoCompatibility.GetMediaType(gelatoAssembly);
             if (stremioMediaTypeEnum == null)
             {
                 _logger.LogError("[StreamCache] StremioMediaType enum not found");
                 throw new InvalidOperationException("StremioMediaType enum not found");
             }
 
-            var mediaTypeValue = mediaType == "movie" 
-                ? Enum.Parse(stremioMediaTypeEnum, "Movie") 
-                : Enum.Parse(stremioMediaTypeEnum, "Series");
-
-            // Call GetStreamsAsync(string id, StremioMediaType mediaType)
-            var getStreamsMethod = stremioProvider.GetType().GetMethod("GetStreamsAsync", 
-                new[] { typeof(string), stremioMediaTypeEnum });
-            if (getStreamsMethod == null)
-            {
-                _logger.LogError("[StreamCache] GetStreamsAsync method not found");
-                throw new InvalidOperationException("GetStreamsAsync method not found");
-            }
-
-            // Invoke GetStreamsAsync
-            var streamsTask = (System.Threading.Tasks.Task)getStreamsMethod.Invoke(stremioProvider, new object[] { stremioId, mediaTypeValue })!;
-            await streamsTask.ConfigureAwait(false);
-
-            var resultProperty = streamsTask.GetType().GetProperty("Result");
-            var streams = resultProperty?.GetValue(streamsTask) as System.Collections.IList;
+            var mediaTypeValue = GelatoCompatibility.ParseMediaType(
+                stremioMediaTypeEnum,
+                series: mediaType != "movie");
+            var streams = await GelatoCompatibility
+                .GetStreamsAsync(gelatoAssembly, stremioProvider, stremioId, mediaTypeValue)
+                .ConfigureAwait(false);
 
             if (streams == null || streams.Count == 0)
             {

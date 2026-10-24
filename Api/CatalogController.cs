@@ -4,8 +4,11 @@ using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
+using Baklava.Helpers;
 using Baklava.Services;
+using MediaBrowser.Common.Api;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Library;
@@ -362,6 +365,7 @@ namespace Baklava.Api
         /// Simple synchronous processing: fetch items, import via Gelato, add to collection.
         /// </summary>
         [HttpPost("{catalogId}/library")]
+        [Authorize(Policy = Policies.RequiresElevation)]
         public async Task<ActionResult<CreateLibraryResponse>> CreateLibraryFromCatalog(
             string catalogId,
             [FromQuery] string type = "movie",
@@ -428,11 +432,9 @@ namespace Baklava.Api
                     return StatusCode(500, "Failed to create collection");
 
                 // 3. Get Gelato manager for imports
-                var (gelatoManager, managerType, metaTypeEnum, gelatoScope) = GetGelatoReferences();
+                var (gelatoManager, gelatoScope) = GetCurrentGelatoReferences();
                 // Ensure scope is disposed at end of method
                 using var _ = gelatoScope;
-
-                var gelatoFolderPath = GetGelatoFolderPath(mediaType);
 
                 // 4. Import items in parallel/batches
                 var itemsToImport = items.Take(maxItems).ToList();
@@ -495,10 +497,14 @@ namespace Baklava.Api
                                 // Cache streams in background for existing items
                                 Task.Run(() => CacheStreamsInBackground(libraryItem.Id.ToString(), imdbId, item.Id, mediaType));
                             }
-                            else if (gelatoManager != null && !string.IsNullOrEmpty(gelatoFolderPath))
+                            else if (gelatoManager != null)
                             {
                                 _logger.LogDebug("[CatalogController] Importing series: {Name} ({ImdbId})", item.Name ?? imdbId, imdbId);
-                                var importedIdStr = await ImportItemViaGelato(imdbId, mediaType, gelatoManager, managerType, metaTypeEnum, gelatoFolderPath).ConfigureAwait(false);
+                                var importedIdStr = await ImportItemViaGelato(
+                                    imdbId,
+                                    mediaType,
+                                    gelatoManager,
+                                    HttpContext.RequestAborted).ConfigureAwait(false);
                                 
                                 if (!string.IsNullOrEmpty(importedIdStr) && Guid.TryParse(importedIdStr, out var newGuid))
                                 {
@@ -518,8 +524,8 @@ namespace Baklava.Api
                             else
                             {
                                 failedCount++;
-                                _logger.LogError("[CatalogController] ✗ Cannot import {Name} ({ImdbId}) - Gelato manager: {HasManager}, Folder path: {HasPath}", 
-                                    item.Name ?? imdbId, imdbId, gelatoManager != null, !string.IsNullOrEmpty(gelatoFolderPath));
+                                _logger.LogError("[CatalogController] ✗ Cannot import {Name} ({ImdbId}) - Gelato manager unavailable",
+                                    item.Name ?? imdbId, imdbId);
                             }
                         }
                         catch (Exception ex)
@@ -534,7 +540,7 @@ namespace Baklava.Api
                         if (i < itemsToImport.Count - 1)
                         {
                             _logger.LogDebug("[CatalogController] Waiting {Delay}ms before next series...", seriesDelay);
-                            await Task.Delay(seriesDelay).ConfigureAwait(false);
+                            await Task.Delay(seriesDelay, HttpContext.RequestAborted).ConfigureAwait(false);
                         }
                     }
                 }
@@ -547,7 +553,8 @@ namespace Baklava.Api
                     
                     var parallelOptions = new ParallelOptions 
                     { 
-                        MaxDegreeOfParallelism = maxParallel
+                        MaxDegreeOfParallelism = maxParallel,
+                        CancellationToken = HttpContext.RequestAborted
                     };
 
                     await Parallel.ForEachAsync(itemsToImport, parallelOptions, async (item, ct) =>
@@ -590,10 +597,14 @@ namespace Baklava.Api
                             }
 
                             // Import via Gelato
-                            if (gelatoManager != null && !string.IsNullOrEmpty(gelatoFolderPath))
+                            if (gelatoManager != null)
                             {
                                 _logger.LogDebug("[CatalogController] Importing movie: {Name} ({ImdbId})", item.Name ?? imdbId, imdbId);
-                                var importedIdStr = await ImportItemViaGelato(imdbId, mediaType, gelatoManager, managerType, metaTypeEnum, gelatoFolderPath).ConfigureAwait(false);
+                                var importedIdStr = await ImportItemViaGelato(
+                                    imdbId,
+                                    mediaType,
+                                    gelatoManager,
+                                    ct).ConfigureAwait(false);
                                 
                                 if (!string.IsNullOrEmpty(importedIdStr))
                                 {
@@ -621,8 +632,8 @@ namespace Baklava.Api
                             else
                             {
                                 System.Threading.Interlocked.Increment(ref failedCount);
-                                _logger.LogError("[CatalogController] ✗ Cannot import {Name} ({ImdbId}) - Gelato manager: {HasManager}, Folder path: {HasPath}", 
-                                    item.Name ?? imdbId, imdbId, gelatoManager != null, !string.IsNullOrEmpty(gelatoFolderPath));
+                                _logger.LogError("[CatalogController] ✗ Cannot import {Name} ({ImdbId}) - Gelato manager unavailable",
+                                    item.Name ?? imdbId, imdbId);
                             }
                         }
                         catch (Exception ex)
@@ -747,6 +758,25 @@ namespace Baklava.Api
         /// <summary>
         /// Helper: Get Gelato manager and types via reflection using fresh DI scope
         /// </summary>
+        private (object Manager, IServiceScope Scope) GetCurrentGelatoReferences()
+        {
+            var gelatoAssembly = GelatoCompatibility.GetAssembly();
+            if (gelatoAssembly is null)
+            {
+                return (null, null);
+            }
+
+            var scope = _scopeFactory.CreateScope();
+            var manager = GelatoCompatibility.GetManager(scope.ServiceProvider, gelatoAssembly);
+            if (manager is null)
+            {
+                scope.Dispose();
+                return (null, null);
+            }
+
+            return (manager, scope);
+        }
+
         private (object Manager, Type ManagerType, Type MetaTypeEnum, IServiceScope Scope) GetGelatoReferences()
         {
             try
@@ -922,6 +952,65 @@ namespace Baklava.Api
         /// <summary>
         /// Helper: Import a single item via Gelato's InsertMeta
         /// </summary>
+        private async Task<string> ImportItemViaGelato(
+            string imdbId,
+            string mediaType,
+            object gelatoManager,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                var gelatoAssembly = gelatoManager.GetType().Assembly;
+                var mediaTypeEnum = GelatoCompatibility.GetMediaType(gelatoAssembly);
+                if (mediaTypeEnum is null)
+                {
+                    return null;
+                }
+
+                var isSeries = string.Equals(mediaType, "tv", StringComparison.OrdinalIgnoreCase);
+                var mediaTypeValue = GelatoCompatibility.ParseMediaType(mediaTypeEnum, isSeries);
+                var config = GelatoCompatibility.GetConfig(gelatoAssembly, Guid.Empty);
+                var provider = config is null ? null : GelatoCompatibility.GetStremioProvider(config);
+                var meta = provider is null
+                    ? null
+                    : await GelatoCompatibility.GetMetaAsync(provider, imdbId, mediaTypeValue)
+                        .ConfigureAwait(false);
+                meta ??= GelatoCompatibility.CreateMeta(gelatoAssembly, imdbId, mediaTypeValue);
+
+                var parentFolder = GelatoCompatibility.GetRootFolder(gelatoManager, isSeries, Guid.Empty);
+                if (parentFolder is null)
+                {
+                    _logger.LogError("[CatalogController] Gelato root folder not found for {Type}", mediaType);
+                    return null;
+                }
+
+                var insertedItem = await GelatoCompatibility.InsertMetaAsync(
+                    gelatoManager,
+                    parentFolder,
+                    meta,
+                    user: null,
+                    allowRemoteRefresh: false,
+                    refreshItem: true,
+                    queueRefreshItem: false,
+                    cancellationToken).ConfigureAwait(false);
+                return GelatoCompatibility.GetItemId(insertedItem);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (System.Reflection.TargetInvocationException tie)
+            {
+                _logger.LogError(tie.InnerException ?? tie, "[CatalogController] Gelato import failed for {ImdbId}", imdbId);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[CatalogController] Import failed for {ImdbId}", imdbId);
+                return null;
+            }
+        }
+
         /// <summary>
         /// Helper: Import a single item via Gelato's InsertMeta
         /// </summary>

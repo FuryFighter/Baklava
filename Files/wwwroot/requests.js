@@ -655,23 +655,30 @@
             return;
         }
 
-        // Use legacy header only
-        const headerRight = document.querySelector('.headerRight');
+        if (!window.ApiClient?.getCurrentUserId()) return;
+
+        // Modern Jellyfin 12 uses a React/MUI header; legacy layouts retain headerRight.
+        const modernUserButton = Array.from(document.querySelectorAll('button[aria-controls="app-user-menu"]'))
+            .find(button => button.getClientRects().length > 0);
+        const headerRight = modernUserButton?.parentElement || Array.from(document.querySelectorAll('.headerRight'))
+            .find(header => header.getClientRects().length > 0);
         if (!headerRight) {
-            console.log('[Requests] No header found, will retry');
-            setTimeout(addRequestsButton, 500);
+            // The observer below retries when a header is mounted. Avoid accumulating timers
+            // for every mutation while a React page or the sign-in screen is rendering.
             return;
         }
 
-        console.log('[Requests] Adding button to legacy header');
-
         const btn = document.createElement('button');
+        btn.type = 'button';
         btn.setAttribute('is', 'paper-icon-button-light');
         btn.setAttribute('data-role', 'requests-button');
-        btn.className = 'headerButton headerButtonRight headerRequestsButton paper-icon-button-light';
+        btn.setAttribute('aria-label', 'Media Requests');
+        btn.className = modernUserButton
+            ? `${modernUserButton.className} headerRequestsButton mui-requests-button`
+            : 'headerButton headerButtonRight headerRequestsButton paper-icon-button-light';
         btn.title = 'Media Requests';
         btn.style.position = 'relative'; // Needed for badge positioning
-        btn.innerHTML = '<span class="material-icons list_alt" aria-hidden="true"></span>';
+        btn.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden="true"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14zM7 7h2v2H7zm4 0h6v2h-6zM7 11h2v2H7zm4 0h6v2h-6zM7 15h2v2H7zm4 0h6v2h-6z"/></svg>';
 
         // Add notification badge element
         const badge = document.createElement('span');
@@ -696,8 +703,8 @@
         `;
         btn.appendChild(badge);
 
-        const userButton = headerRight.querySelector('.headerUserButton');
-        if (userButton) {
+        const userButton = modernUserButton || headerRight.querySelector('.headerUserButton');
+        if (userButton?.parentElement === headerRight) {
             headerRight.insertBefore(btn, userButton);
         } else {
             headerRight.appendChild(btn);

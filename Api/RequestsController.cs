@@ -1,55 +1,91 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.Json.Serialization;
 using System.Net.Http;
+using System.Security.Claims;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+using MediaBrowser.Common.Api;
+using MediaBrowser.Controller.Library;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Baklava.Services;
 
 namespace Baklava.Api
 {
     [ApiController]
     [Route("api/baklava/requests")]
     [Produces("application/json")]
+    [Authorize]
     public class RequestsController : ControllerBase
     {
-        private readonly ILogger<RequestsController> _logger;
+        private static readonly object ConfigurationLock = new();
 
-        public RequestsController(ILogger<RequestsController> logger)
+        private readonly ILogger<RequestsController> _logger;
+        private readonly IUserManager _userManager;
+        private readonly IAuthorizationService _authorizationService;
+        private readonly RequestImportService _requestImport;
+
+        public RequestsController(
+            ILogger<RequestsController> logger,
+            IUserManager userManager,
+            IAuthorizationService authorizationService,
+            RequestImportService requestImport)
         {
             _logger = logger;
+            _userManager = userManager;
+            _authorizationService = authorizationService;
+            _requestImport = requestImport;
         }
 
         [HttpGet]
-        public ActionResult<List<MediaRequest>> GetRequests()
+        public async Task<ActionResult<List<MediaRequest>>> GetRequests()
         {
-            _logger.LogInformation("[RequestsController] GET called");
-            
-            var config = Plugin.Instance?.Configuration;
-            if (config == null)
+            var currentUser = GetAuthenticatedUser();
+            if (currentUser == null)
             {
-                _logger.LogWarning("[RequestsController] Config is null");
-                return Ok(new List<MediaRequest>());
+                return Unauthorized();
             }
 
-            var requests = config.Requests ?? new List<MediaRequest>();
-            _logger.LogInformation($"[RequestsController] Returning {requests.Count} requests");
-            
-            // Log first request details for debugging
-            if (requests.Count > 0)
+            var isElevated = await IsElevatedAsync().ConfigureAwait(false);
+            lock (ConfigurationLock)
             {
-                var first = requests[0];
-                _logger.LogInformation($"[RequestsController] First request - Id: {first.Id}, Username: {first.Username}, Title: {first.Title}, Status: {first.Status}");
+                var config = Plugin.Instance?.Configuration;
+                if (config == null)
+                {
+                    _logger.LogWarning("[RequestsController] Config is null");
+                    return Ok(new List<MediaRequest>());
+                }
+
+                var requests = config.Requests ?? new List<MediaRequest>();
+                var visibleRequests = isElevated
+                    ? requests.ToList()
+                    : requests.Where(request => IsOwnedBy(request, currentUser.Id)).ToList();
+
+                _logger.LogInformation(
+                    "[RequestsController] Returning {RequestCount} requests to user {UserId}",
+                    visibleRequests.Count,
+                    currentUser.Id);
+                return Ok(visibleRequests);
             }
-            
-            return Ok(requests);
         }
 
         [HttpPost]
-        public ActionResult<MediaRequest> CreateRequest([FromBody] MediaRequest request)
+        public async Task<ActionResult<MediaRequest>> CreateRequest([FromBody] MediaRequest request)
         {
-            _logger.LogInformation("[RequestsController] POST called");
-            
+            if (request == null)
+            {
+                return BadRequest("Request data is required");
+            }
+
+            var currentUser = GetAuthenticatedUser();
+            if (currentUser == null)
+            {
+                return Unauthorized();
+            }
+
+            var isElevated = await IsElevatedAsync().ConfigureAwait(false);
             var config = Plugin.Instance?.Configuration;
             if (config == null)
             {
@@ -57,65 +93,55 @@ namespace Baklava.Api
                 return BadRequest("Plugin configuration not available");
             }
 
-            if (request == null)
+            if (config.DisableNonAdminRequests && !isElevated)
             {
-                return BadRequest("Request data is required");
+                return Forbid();
             }
 
-            // Auto-generate ID if not provided
-            if (string.IsNullOrEmpty(request.Id))
-            {
-                request.Id = $"{request.Username}_{request.TmdbId}_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-            }
+            // Request identity and workflow state are always derived on the server.
+            request.Username = currentUser.Username;
+            request.UserId = currentUser.Id.ToString("N");
+            request.Status = "pending";
+            request.ApprovedBy = null;
 
-            // Normalize and ensure media type fields are set
             request.ItemType = (request.ItemType ?? string.Empty).ToLowerInvariant();
             if (string.IsNullOrEmpty(request.TmdbMediaType))
             {
                 request.TmdbMediaType = request.ItemType == "series" ? "tv" : "movie";
             }
 
-            // Server-side validation: if we have an IMDB id, prefer TMDB's tv_results mapping
-            // This avoids saving a movie tmdbId when the IMDB maps to a TV show.
+            // If an IMDb ID is present, prefer TMDB's canonical media-type mapping.
+            // Authentication and request policy checks deliberately happen before this call.
             try
             {
-                if (!string.IsNullOrEmpty(request.ImdbId))
+                if (!string.IsNullOrEmpty(request.ImdbId) && !string.IsNullOrEmpty(config.TmdbApiKey))
                 {
-                    var cfg = Plugin.Instance?.Configuration;
-                    var apiKey = cfg?.TmdbApiKey;
-                    if (!string.IsNullOrEmpty(apiKey))
+                    var tmdbFindUrl = $"https://api.themoviedb.org/3/find/{Uri.EscapeDataString(request.ImdbId)}?api_key={Uri.EscapeDataString(config.TmdbApiKey)}&external_source=imdb_id";
+                    using var http = new HttpClient();
+                    var response = await http.GetAsync(tmdbFindUrl).ConfigureAwait(false);
+                    if (response.IsSuccessStatusCode)
                     {
-                        var tmdbFindUrl = $"https://api.themoviedb.org/3/find/{Uri.EscapeDataString(request.ImdbId)}?api_key={Uri.EscapeDataString(apiKey)}&external_source=imdb_id";
-                        using (var http = new HttpClient())
+                        var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        using var document = System.Text.Json.JsonDocument.Parse(content);
+                        var root = document.RootElement;
+                        if (root.TryGetProperty("tv_results", out var tvResults) && tvResults.GetArrayLength() > 0)
                         {
-                            var resp = http.GetAsync(tmdbFindUrl).GetAwaiter().GetResult();
-                            if (resp.IsSuccessStatusCode)
+                            var first = tvResults[0];
+                            if (first.TryGetProperty("id", out var idProperty))
                             {
-                                var content = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                                using (var doc = System.Text.Json.JsonDocument.Parse(content))
-                                {
-                                    var root = doc.RootElement;
-                                    if (root.TryGetProperty("tv_results", out var tvResults) && tvResults.GetArrayLength() > 0)
-                                    {
-                                        var first = tvResults[0];
-                                        if (first.TryGetProperty("id", out var idProp))
-                                        {
-                                            request.TmdbId = idProp.GetRawText().Trim('"');
-                                            request.TmdbMediaType = "tv";
-                                            request.ItemType = "series";
-                                        }
-                                    }
-                                    else if (root.TryGetProperty("movie_results", out var movieResults) && movieResults.GetArrayLength() > 0)
-                                    {
-                                        var first = movieResults[0];
-                                        if (first.TryGetProperty("id", out var idProp))
-                                        {
-                                            request.TmdbId = idProp.GetRawText().Trim('"');
-                                            request.TmdbMediaType = "movie";
-                                            request.ItemType = "movie";
-                                        }
-                                    }
-                                }
+                                request.TmdbId = idProperty.GetRawText().Trim('"');
+                                request.TmdbMediaType = "tv";
+                                request.ItemType = "series";
+                            }
+                        }
+                        else if (root.TryGetProperty("movie_results", out var movieResults) && movieResults.GetArrayLength() > 0)
+                        {
+                            var first = movieResults[0];
+                            if (first.TryGetProperty("id", out var idProperty))
+                            {
+                                request.TmdbId = idProperty.GetRawText().Trim('"');
+                                request.TmdbMediaType = "movie";
+                                request.ItemType = "movie";
                             }
                         }
                     }
@@ -126,84 +152,108 @@ namespace Baklava.Api
                 _logger.LogWarning(ex, "[RequestsController] TMDB find check failed for imdbId={ImdbId}", request.ImdbId);
             }
 
-            // Set default status
-            if (string.IsNullOrEmpty(request.Status))
+            lock (ConfigurationLock)
             {
-                request.Status = "pending";
+                config.Requests ??= new List<MediaRequest>();
+
+                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                string requestId;
+                do
+                {
+                    requestId = $"{currentUser.Username}_{request.TmdbId}_{timestamp++}";
+                }
+                while (config.Requests.Any(existing => string.Equals(existing.Id, requestId, StringComparison.Ordinal)));
+
+                request.Id = requestId;
+                request.Timestamp = timestamp - 1;
+                config.Requests.Add(request);
+                Plugin.Instance.SaveConfiguration();
             }
 
-            // Set timestamp
-            request.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-            // Add to list
-            if (config.Requests == null)
-            {
-                config.Requests = new List<MediaRequest>();
-            }
-            
-            config.Requests.Add(request);
-            Plugin.Instance.SaveConfiguration();
-
-            _logger.LogInformation($"[RequestsController] Created request: {request.Id}");
+            _logger.LogInformation("[RequestsController] Created request {RequestId} for user {UserId}", request.Id, currentUser.Id);
             return Ok(request);
         }
 
         [HttpPut("{id}")]
-        public ActionResult UpdateRequest(string id, [FromBody] UpdateRequestDto update)
+        [Authorize(Policy = Policies.RequiresElevation)]
+        public async Task<ActionResult> UpdateRequest(string id, [FromBody] UpdateRequestDto update)
         {
-            _logger.LogInformation($"[RequestsController] PUT called for {id}");
-            
-            var config = Plugin.Instance?.Configuration;
-            if (config == null)
+            var currentUser = GetAuthenticatedUser();
+            if (currentUser == null)
             {
-                _logger.LogWarning("[RequestsController] Config is null");
-                return BadRequest("Plugin configuration not available");
+                return Unauthorized();
             }
 
-            var request = config.Requests?.FirstOrDefault(r => r.Id == id);
-            if (request == null)
+            if (update == null || string.IsNullOrWhiteSpace(update.Status))
             {
-                return NotFound($"Request {id} not found");
+                return BadRequest("A status is required");
             }
 
-            // Update fields. If an admin approves, create a separate admin-owned
-            // approved copy so admin and user can delete independently.
-            if (!string.IsNullOrEmpty(update.Status))
+            var status = update.Status.Trim().ToLowerInvariant();
+            if (status != "approved" && status != "rejected")
             {
-                // Always update the original request's status so the requester sees it as approved
-                request.Status = update.Status;
+                return BadRequest("Status must be approved or rejected");
             }
 
-            if (!string.IsNullOrEmpty(update.ApprovedBy))
-            {
-                request.ApprovedBy = update.ApprovedBy;
-            }
+            MediaRequest request;
+            string importedId = null;
 
-            // If approving and ApprovedBy is provided and the approver is different
-            // from the original requester, create an admin-owned approved copy.
-            // Same logic for rejected - create admin-owned rejected copy.
-            try
+            if (status == "approved")
             {
-                if (!string.IsNullOrEmpty(update.Status) && update.Status.Equals("approved", StringComparison.OrdinalIgnoreCase)
-                    && !string.IsNullOrEmpty(update.ApprovedBy) && !string.Equals(update.ApprovedBy, request.Username, StringComparison.OrdinalIgnoreCase))
+                lock (ConfigurationLock)
                 {
-                    var cfg = Plugin.Instance?.Configuration;
+                    request = Plugin.Instance?.Configuration?.Requests?.FirstOrDefault(candidate => candidate.Id == id);
+                    if (request == null) return NotFound($"Request {id} not found");
+                }
+                try
+                {
+                    importedId = await _requestImport.ImportAsync(request, HttpContext.RequestAborted).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Could not import approved request {RequestId}", id);
+                    return StatusCode(502, new { error = "Gelato could not import this request. Check its addon and library configuration. The request has not been approved." });
+                }
+            }
 
-                    // Avoid creating duplicate admin-approved entries for the same approver + tmdb
-                    var existingAdminCopy = cfg?.Requests?.FirstOrDefault(r =>
-                        r.Username == update.ApprovedBy &&
-                        r.TmdbId == request.TmdbId &&
-                        r.Status != null && r.Status.Equals("approved", StringComparison.OrdinalIgnoreCase)
-                    );
+            lock (ConfigurationLock)
+            {
+                var config = Plugin.Instance?.Configuration;
+                if (config == null)
+                {
+                    _logger.LogWarning("[RequestsController] Config is null");
+                    return BadRequest("Plugin configuration not available");
+                }
+
+                request = config.Requests?.FirstOrDefault(candidate => candidate.Id == id);
+                if (request == null)
+                {
+                    return NotFound($"Request {id} not found");
+                }
+
+                request.Status = status;
+                request.ApprovedBy = currentUser.Username;
+                if (importedId != null) request.JellyfinId = importedId;
+
+                // Preserve the existing admin-owned status copy used by the UI, but derive
+                // both its owner and approver from the authenticated Jellyfin user.
+                if (!IsOwnedBy(request, currentUser.Id))
+                {
+                    config.Requests ??= new List<MediaRequest>();
+                    var existingAdminCopy = config.Requests.FirstOrDefault(candidate =>
+                        IsOwnedBy(candidate, currentUser.Id)
+                        && candidate.TmdbId == request.TmdbId
+                        && string.Equals(candidate.Status, status, StringComparison.OrdinalIgnoreCase));
 
                     if (existingAdminCopy == null)
                     {
-                        var adminCopy = new MediaRequest
+                        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                        config.Requests.Add(new MediaRequest
                         {
-                            Id = $"{update.ApprovedBy}_{request.TmdbId}_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}",
-                            Username = update.ApprovedBy,
-                            UserId = string.Empty,
-                            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                            Id = $"{currentUser.Username}_{request.TmdbId}_{timestamp}",
+                            Username = currentUser.Username,
+                            UserId = currentUser.Id.ToString("N"),
+                            Timestamp = timestamp,
                             Title = request.Title,
                             Year = request.Year,
                             Img = request.Img,
@@ -212,183 +262,156 @@ namespace Baklava.Api
                             JellyfinId = request.JellyfinId,
                             ItemType = request.ItemType,
                             TmdbMediaType = request.TmdbMediaType,
-                            Status = "approved",
-                            ApprovedBy = update.ApprovedBy
-                        };
-
-                        if (cfg?.Requests == null) cfg.Requests = new List<MediaRequest>();
-                        cfg.Requests.Add(adminCopy);
+                            Status = status,
+                            ApprovedBy = currentUser.Username
+                        });
                     }
                 }
-                else if (!string.IsNullOrEmpty(update.Status) && update.Status.Equals("rejected", StringComparison.OrdinalIgnoreCase)
-                    && !string.IsNullOrEmpty(update.ApprovedBy) && !string.Equals(update.ApprovedBy, request.Username, StringComparison.OrdinalIgnoreCase))
-                {
-                    var cfg = Plugin.Instance?.Configuration;
 
-                    // Avoid creating duplicate admin-rejected entries for the same rejecter + tmdb
-                    var existingAdminCopy = cfg?.Requests?.FirstOrDefault(r =>
-                        r.Username == update.ApprovedBy &&
-                        r.TmdbId == request.TmdbId &&
-                        r.Status != null && r.Status.Equals("rejected", StringComparison.OrdinalIgnoreCase)
-                    );
-
-                    if (existingAdminCopy == null)
-                    {
-                        var adminCopy = new MediaRequest
-                        {
-                            Id = $"{update.ApprovedBy}_{request.TmdbId}_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}",
-                            Username = update.ApprovedBy,
-                            UserId = string.Empty,
-                            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                            Title = request.Title,
-                            Year = request.Year,
-                            Img = request.Img,
-                            ImdbId = request.ImdbId,
-                            TmdbId = request.TmdbId,
-                            JellyfinId = request.JellyfinId,
-                            ItemType = request.ItemType,
-                            TmdbMediaType = request.TmdbMediaType,
-                            Status = "rejected",
-                            ApprovedBy = update.ApprovedBy
-                        };
-
-                        if (cfg?.Requests == null) cfg.Requests = new List<MediaRequest>();
-                        cfg.Requests.Add(adminCopy);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "[RequestsController] Could not create admin copy for approved request {RequestId}", id);
+                Plugin.Instance.SaveConfiguration();
             }
 
-            Plugin.Instance.SaveConfiguration();
-            _logger.LogInformation($"[RequestsController] Updated request {id}: status={request.Status}");
-
-            // If the request was approved, trigger Gelato metadata refresh server-side.
-            try
-            {
-                if (!string.IsNullOrEmpty(request.Status) && request.Status.Equals("approved", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Run in background so we don't block the HTTP response.
-                    _ = System.Threading.Tasks.Task.Run(async () =>
-                    {
-                        try
-                        {
-                            var cfg = Plugin.Instance?.Configuration;
-                            string baseUrl = cfg?.GelatoBaseUrl;
-                            if (string.IsNullOrEmpty(baseUrl))
-                            {
-                                baseUrl = $"{Request.Scheme}://{Request.Host.Value}";
-                            }
-
-                            var type = (request.TmdbMediaType ?? request.ItemType ?? "movie");
-                            if (type == "series") type = "tv";
-                            if (type == "tv" || type == "movie")
-                            {
-                                var imdb = request.ImdbId;
-                                if (!string.IsNullOrEmpty(imdb))
-                                {
-                                    var url = baseUrl.TrimEnd('/') + $"/gelato/meta/{type}/{Uri.EscapeDataString(imdb)}";
-                                    using var http = new HttpClient();
-                                    if (!string.IsNullOrEmpty(cfg?.GelatoAuthHeader))
-                                    {
-                                        // Allow configuration to specify either a full header name and value
-                                        // (for example: "X-Emby-Token: <token>") or just a token/value which
-                                        // will be applied to the Authorization header.
-                                        var header = cfg.GelatoAuthHeader;
-                                        var idx = header.IndexOf(':');
-                                        if (idx > -1)
-                                        {
-                                            var name = header.Substring(0, idx).Trim();
-                                            var value = header.Substring(idx + 1).Trim();
-                                            try { http.DefaultRequestHeaders.Remove(name); } catch { }
-                                            http.DefaultRequestHeaders.Add(name, value);
-                                        }
-                                        else
-                                        {
-                                            try { http.DefaultRequestHeaders.Remove("Authorization"); } catch { }
-                                            http.DefaultRequestHeaders.Add("Authorization", header);
-                                        }
-                                    }
-                                    _logger.LogInformation("[RequestsController] Calling Gelato at {Url} for approved request {RequestId}", url, id);
-                                    var resp = await http.GetAsync(url).ConfigureAwait(false);
-                                    _logger.LogInformation("[RequestsController] Gelato responded {Status} for {RequestId}", resp.StatusCode, id);
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "[RequestsController] Error calling Gelato for approved request {RequestId}", id);
-                        }
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "[RequestsController] Failed to trigger Gelato for request {RequestId}", id);
-            }
+            _logger.LogInformation(
+                "[RequestsController] Updated request {RequestId}: status={Status}, approver={ApproverId}",
+                id,
+                status,
+                currentUser.Id);
 
             return Ok();
         }
 
         [HttpDelete("{id}")]
-        public ActionResult DeleteRequest(string id)
+        public async Task<ActionResult> DeleteRequest(string id)
         {
-            _logger.LogInformation($"[RequestsController] DELETE called for {id}");
-            
-            var config = Plugin.Instance?.Configuration;
-            if (config == null)
+            var currentUser = GetAuthenticatedUser();
+            if (currentUser == null)
             {
-                _logger.LogWarning("[RequestsController] Config is null");
-                return BadRequest("Plugin configuration not available");
+                return Unauthorized();
             }
 
-            var request = config.Requests?.FirstOrDefault(r => r.Id == id);
-            if (request == null)
+            var isElevated = await IsElevatedAsync().ConfigureAwait(false);
+            lock (ConfigurationLock)
             {
-                return NotFound($"Request {id} not found");
+                var config = Plugin.Instance?.Configuration;
+                if (config == null)
+                {
+                    _logger.LogWarning("[RequestsController] Config is null");
+                    return BadRequest("Plugin configuration not available");
+                }
+
+                var request = config.Requests?.FirstOrDefault(candidate => candidate.Id == id);
+                if (request == null)
+                {
+                    return NotFound($"Request {id} not found");
+                }
+
+                if (!isElevated && !IsOwnedBy(request, currentUser.Id))
+                {
+                    return Forbid();
+                }
+
+                config.Requests.Remove(request);
+                Plugin.Instance.SaveConfiguration();
             }
 
-            config.Requests.Remove(request);
-            Plugin.Instance.SaveConfiguration();
-
-            _logger.LogInformation($"[RequestsController] Deleted request {id}");
+            _logger.LogInformation("[RequestsController] Deleted request {RequestId} for user {UserId}", id, currentUser.Id);
             return Ok();
         }
+
         /// <summary>
-        /// Clean up invalid requests (undefined/empty IDs)
+        /// Clean up invalid requests (undefined/empty IDs).
         /// </summary>
         [HttpPost("cleanup")]
+        [Authorize(Policy = Policies.RequiresElevation)]
         public ActionResult CleanupRequests()
         {
-            _logger.LogInformation("[RequestsController] Cleanup called");
-            
-            var config = Plugin.Instance?.Configuration;
-            if (config == null)
+            lock (ConfigurationLock)
             {
-                return BadRequest("Configuration not available");
+                var config = Plugin.Instance?.Configuration;
+                if (config == null)
+                {
+                    return BadRequest("Configuration not available");
+                }
+
+                var requests = config.Requests ?? new List<MediaRequest>();
+                var validRequests = requests.Where(request =>
+                    !string.IsNullOrEmpty(request.ImdbId) && request.ImdbId != "undefined"
+                    && !string.IsNullOrEmpty(request.TmdbId) && request.TmdbId != "undefined").ToList();
+                var removed = requests.Count - validRequests.Count;
+
+                if (removed > 0)
+                {
+                    config.Requests = validRequests;
+                    Plugin.Instance.SaveConfiguration();
+                    _logger.LogInformation("[RequestsController] Cleaned up {RemovedCount} invalid requests", removed);
+                }
+
+                return Ok(new { removed, remaining = validRequests.Count });
+            }
+        }
+
+        private RequestUser GetAuthenticatedUser()
+        {
+            var userIdValues = new[]
+            {
+                User.FindFirst("UserId")?.Value,
+                User.FindFirst("Jellyfin-UserId")?.Value,
+                User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+            };
+            var userId = Guid.Empty;
+            if (!userIdValues.Any(value => Guid.TryParse(value, out userId)))
+            {
+                _logger.LogWarning("[RequestsController] Authenticated principal did not contain a valid Jellyfin user ID");
+                return null;
             }
 
-            var requests = config.Requests ?? new List<MediaRequest>();
-            var before = requests.Count;
-            
-            // Remove requests with undefined/null/empty IDs
-            var validRequests = requests.Where(r => 
-                !string.IsNullOrEmpty(r.ImdbId) && r.ImdbId != "undefined" &&
-                !string.IsNullOrEmpty(r.TmdbId) && r.TmdbId != "undefined"
-            ).ToList();
-            
-            var removed = before - validRequests.Count;
-            
-            if (removed > 0)
+            var user = _userManager.GetUserById(userId);
+            return user == null ? null : new RequestUser(user.Id, user.Username);
+        }
+
+        private async Task<bool> IsElevatedAsync()
+        {
+            var result = await _authorizationService.AuthorizeAsync(User, Policies.RequiresElevation).ConfigureAwait(false);
+            return result.Succeeded;
+        }
+
+        private static bool IsOwnedBy(MediaRequest request, Guid userId)
+        {
+            return Guid.TryParse(request.UserId, out var requestUserId) && requestUserId == userId;
+        }
+
+        private static void ApplyGelatoAuthorization(HttpClient http, string authHeader)
+        {
+            if (string.IsNullOrEmpty(authHeader))
             {
-                config.Requests = validRequests;
-                Plugin.Instance.SaveConfiguration();
-                _logger.LogInformation($"[RequestsController] Cleaned up {removed} invalid requests");
+                return;
             }
-            
-            return Ok(new { removed, remaining = validRequests.Count });
+
+            var separatorIndex = authHeader.IndexOf(':');
+            if (separatorIndex > -1)
+            {
+                var name = authHeader.Substring(0, separatorIndex).Trim();
+                var value = authHeader.Substring(separatorIndex + 1).Trim();
+                http.DefaultRequestHeaders.Remove(name);
+                http.DefaultRequestHeaders.Add(name, value);
+                return;
+            }
+
+            http.DefaultRequestHeaders.Remove("Authorization");
+            http.DefaultRequestHeaders.Add("Authorization", authHeader);
+        }
+
+        private sealed class RequestUser
+        {
+            public RequestUser(Guid id, string username)
+            {
+                Id = id;
+                Username = username;
+            }
+
+            public Guid Id { get; }
+
+            public string Username { get; }
         }
     }
 
@@ -427,8 +450,8 @@ namespace Baklava.Api
         [JsonPropertyName("itemType")]
         public string ItemType { get; set; }
 
-    [JsonPropertyName("tmdbMediaType")]
-    public string TmdbMediaType { get; set; }
+        [JsonPropertyName("tmdbMediaType")]
+        public string TmdbMediaType { get; set; }
 
         [JsonPropertyName("status")]
         public string Status { get; set; }
