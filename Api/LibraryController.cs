@@ -11,10 +11,14 @@ using MediaBrowser.Model.Querying;
 using MediaBrowser.Model.Users;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Authorization;
+using MediaBrowser.Common.Api;
+using System.Threading.Tasks;
 
 namespace Baklava.Api
 {
     [ApiController]
+    [Authorize]
     [Route("api/baklava/metadata")]
     [Produces("application/json")]
     public class LibraryController : ControllerBase
@@ -22,19 +26,22 @@ namespace Baklava.Api
         private readonly ILogger<LibraryController> _logger;
         private readonly ILibraryManager _libraryManager;
         private readonly IUserManager _userManager;
+        private readonly IAuthorizationService _authorization;
 
         public LibraryController(
             ILogger<LibraryController> logger,
             ILibraryManager libraryManager,
-            IUserManager userManager)
+            IUserManager userManager,
+            IAuthorizationService authorization)
         {
             _logger = logger;
             _libraryManager = libraryManager;
             _userManager = userManager;
+            _authorization = authorization;
         }
 
         [HttpGet("library-status")]
-        public ActionResult CheckLibraryStatus(
+        public async Task<ActionResult> CheckLibraryStatus(
             [FromQuery] string? imdbId,
             [FromQuery] string? tmdbId,
             [FromQuery] string itemType,
@@ -45,6 +52,11 @@ namespace Baklava.Api
             
             try
             {
+                var isAdmin = (await _authorization.AuthorizeAsync(User, null, Policies.RequiresElevation)).Succeeded;
+                var actorId = User.FindFirst("Jellyfin-UserId")?.Value ?? User.FindFirst("UserId")?.Value;
+                var actor = Guid.TryParse(actorId, out var actorGuid) && actorGuid != Guid.Empty
+                    ? _userManager.GetUserById(actorGuid) : null;
+                if (actor == null && !isAdmin) return Forbid();
                 if (string.IsNullOrEmpty(imdbId) && string.IsNullOrEmpty(tmdbId) && string.IsNullOrEmpty(jellyfinId))
                 {
                     return BadRequest(new { error = "Either imdbId, tmdbId, or jellyfinId is required" });
@@ -59,7 +71,7 @@ namespace Baklava.Api
                     // Fast path: Check by Jellyfin ID
                     if (!string.IsNullOrEmpty(jellyfinId) && Guid.TryParse(jellyfinId, out var jfGuid))
                     {
-                        var itemById = _libraryManager.GetItemById(jfGuid);
+                        var itemById = _libraryManager.GetItemById<BaseItem>(jfGuid, actor);
                         if (itemById != null)
                         {
                             var itemTypeName = itemById.GetType().Name;
@@ -78,7 +90,7 @@ namespace Baklava.Api
                     // Slow path: Search library by Provider ID
                     if (!inLibrary && (!string.IsNullOrEmpty(imdbId) || !string.IsNullOrEmpty(tmdbId)))
                     {
-                        var query = new InternalItemsQuery { Recursive = true };
+                        var query = new InternalItemsQuery(actor) { Recursive = true };
                         if (itemType == "series") query.IncludeItemTypes = new[] { BaseItemKind.Series };
                         else if (itemType == "movie") query.IncludeItemTypes = new[] { BaseItemKind.Movie };
 
@@ -112,6 +124,7 @@ namespace Baklava.Api
                 var requests = config?.Requests ?? new List<MediaRequest>();
                 
                 var existingRequest = requests.FirstOrDefault(r =>
+                    (isAdmin || (Guid.TryParse(r.UserId, out var ownerId) && ownerId == actorGuid)) &&
                     r.ItemType == itemType &&
                     (
                         ((foundImdbId != null && !string.IsNullOrEmpty(r.ImdbId) && r.ImdbId == foundImdbId) || 

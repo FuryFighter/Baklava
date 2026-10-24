@@ -4,9 +4,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Baklava.Api;
+using Baklava.Helpers;
 using Baklava.Services;
 using MediaBrowser.Controller.Library;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging;
 
 namespace Baklava.Services
@@ -56,22 +56,11 @@ namespace Baklava.Services
                     return null;
                 }
 
-                var gelatoPlugin = AppDomain.CurrentDomain.GetAssemblies()
-                    .FirstOrDefault(a => a.GetName().Name == "Gelato");
+                var gelatoPlugin = GelatoCompatibility.GetAssembly();
 
                 if (gelatoPlugin == null)
                 {
                     _logger.LogWarning("[Baklava.Subtitle] Gelato plugin assembly NOT FOUND");
-                    return null;
-                }
-
-                var gelatoPluginType = gelatoPlugin.GetType("Gelato.GelatoPlugin");
-                var instanceProp = gelatoPluginType?.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                var gelatoInstance = instanceProp?.GetValue(null);
-
-                if (gelatoInstance == null)
-                {
-                    _logger.LogWarning("[Baklava.Subtitle] Gelato plugin instance is NULL");
                     return null;
                 }
 
@@ -83,46 +72,17 @@ namespace Baklava.Services
                     return null;
                 }
 
-                // Build StremioUri using reflection
-                object? stremioUri = null;
-                try
-                {
-                    var stremioUriType = gelatoPlugin.GetType("Gelato.Common.StremioUri");
-                    var fromBaseItemMethod = stremioUriType?.GetMethod("FromBaseItem", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                    stremioUri = fromBaseItemMethod?.Invoke(null, new object[] { item });
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "[Baklava.Subtitle] FromBaseItem threw exception");
-                }
-
-                if (stremioUri == null)
-                {
-                    _logger.LogWarning("[Baklava.Subtitle] Could not build StremioUri for item {ItemId}", itemId);
-                    return null;
-                }
-
-                // Get the config to access the stremio provider
-                var getConfigMethod = gelatoInstance.GetType().GetMethod("GetConfig");
-                var config = getConfigMethod?.Invoke(gelatoInstance, new object[] { Guid.Empty });
+                var config = GelatoCompatibility.GetConfig(gelatoPlugin, Guid.Empty);
                 
                 if (config == null) return null;
 
-                var stremioProviderField = config.GetType().GetField("stremio");
-                var stremioProvider = stremioProviderField?.GetValue(config);
+                var stremioProvider = GelatoCompatibility.GetStremioProvider(config);
 
                 if (stremioProvider == null) return null;
 
-                // Call GetSubtitlesAsync
-                var getSubtitlesMethod = stremioProvider.GetType().GetMethod("GetSubtitlesAsync");
-                var subtitlesTask = getSubtitlesMethod?.Invoke(stremioProvider, new object?[] { stremioUri, null }) as Task;
-
-                if (subtitlesTask == null) return null;
-
-                await subtitlesTask.ConfigureAwait(false);
-                
-                var resultProperty = subtitlesTask.GetType().GetProperty("Result");
-                var cachedSubs = resultProperty?.GetValue(subtitlesTask);
+                var cachedSubs = await GelatoCompatibility
+                    .GetSubtitlesForItemAsync(gelatoPlugin, stremioProvider, item)
+                    .ConfigureAwait(false);
 
                 if (cachedSubs == null)
                 {

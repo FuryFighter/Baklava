@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-  <TargetFramework>net9.0</TargetFramework>
+  <TargetFramework>net10.0</TargetFramework>
   <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AssemblyName>Baklava</AssemblyName>
     <RootNamespace>Baklava</RootNamespace>
@@ -18,16 +18,15 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Version wildcard used; adjust as needed for compatibility with your Jellyfin server -->
-    <PackageReference Include="Jellyfin.Model" Version="10.*" />
-    <PackageReference Include="Jellyfin.Controller" Version="10.*" />
+    <PackageReference Include="Jellyfin.Model" Version="12.2.0" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.2.0" />
     <!-- Reference Newtonsoft.Json for compile but use server's runtime version -->
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3">
       <ExcludeAssets>runtime</ExcludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <!-- SQLite for Baklava database -->
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0">
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" PrivateAssets="all">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
   </ItemGroup>
@@ -43,6 +42,7 @@
       <!-- patterns of filenames to remove from publish dir -->
       <_ToDelete Include="$(PublishDir)MediaBrowser.*.dll" />
       <_ToDelete Include="$(PublishDir)Jellyfin.*.dll" />
+      <_ToDelete Include="$(PublishDir)Emby.*.dll" />
       <_ToDelete Include="$(PublishDir)Microsoft.Extensions.*.dll" />
       <_ToDelete Include="$(PublishDir)Microsoft.EntityFrameworkCore*.dll" />
       <_ToDelete Include="$(PublishDir)MediaBrowser.*.deps.json" />

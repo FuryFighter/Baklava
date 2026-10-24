@@ -5,14 +5,17 @@ using System.Linq;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Baklava.Helpers;
 using Baklava.Services;
 using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
 
 namespace Baklava.Api
 {
     [ApiController]
+    [Authorize]
     [Route("api/baklava/metadata")]
     [Produces("application/json")]
     public class SearchModalMetadataController : ControllerBase
@@ -55,25 +58,17 @@ namespace Baklava.Api
                     return BadRequest(new { error = "Either imdbId or tmdbId is required" });
                 }
 
-                // 2. Determine Stremio MediaType enum
-                // Gelato.Common.StremioMediaType: Unknown=0, Movie=1, Series=2
-                object? mediaTypeEnum = null;
-                if (string.Equals(itemType, "movie", StringComparison.OrdinalIgnoreCase))
-                {
-                    mediaTypeEnum = 1; // StremioMediaType.Movie
-                }
-                else if (string.Equals(itemType, "series", StringComparison.OrdinalIgnoreCase) || 
-                         string.Equals(itemType, "tv", StringComparison.OrdinalIgnoreCase))
-                {
-                    mediaTypeEnum = 2; // StremioMediaType.Series
-                }
-                else
+                // 2. Validate the media type before mapping it to Gelato's enum by name.
+                var isMovie = string.Equals(itemType, "movie", StringComparison.OrdinalIgnoreCase);
+                var isSeries = string.Equals(itemType, "series", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(itemType, "tv", StringComparison.OrdinalIgnoreCase);
+                if (!isMovie && !isSeries)
                 {
                     return BadRequest(new { error = "Invalid or missing itemType (must be 'movie' or 'series')" });
                 }
 
                 // 3. Reflect into Gelato to get metadata
-                var gelatoData = await FetchMetadataFromGelato(stremioId, mediaTypeEnum);
+                var gelatoData = await FetchMetadataFromGelato(stremioId, isSeries);
                 
                 if (gelatoData != null)
                 {
@@ -145,12 +140,11 @@ namespace Baklava.Api
             }
         }
 
-        private async Task<object?> FetchMetadataFromGelato(string id, object mediaTypeEnum)
+        private async Task<object?> FetchMetadataFromGelato(string id, bool isSeries)
         {
             try
             {
-                var gelatoPlugin = AppDomain.CurrentDomain.GetAssemblies()
-                    .FirstOrDefault(a => a.GetName().Name == "Gelato");
+                var gelatoPlugin = GelatoCompatibility.GetAssembly();
 
                 if (gelatoPlugin == null)
                 {
@@ -158,51 +152,26 @@ namespace Baklava.Api
                     return null;
                 }
 
-                // Get GelatoPlugin.Instance
-                var gelatoPluginType = gelatoPlugin.GetType("Gelato.GelatoPlugin");
-                var instanceProp = gelatoPluginType?.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-                var gelatoInstance = instanceProp?.GetValue(null);
-
-                if (gelatoInstance == null)
-                {
-                    _logger.LogWarning("[Baklava.SearchMetadata] Gelato plugin instance is null");
-                    return null;
-                }
-
-                // Get Config
-                var getConfigMethod = gelatoInstance.GetType().GetMethod("GetConfig");
-                var config = getConfigMethod?.Invoke(gelatoInstance, new object[] { Guid.Empty }); // Guid.Empty for system config
+                var actorId = User.FindFirst("Jellyfin-UserId")?.Value ?? User.FindFirst("UserId")?.Value;
+                Guid.TryParse(actorId, out var userId);
+                var config = GelatoCompatibility.GetConfig(gelatoPlugin, userId);
 
                 if (config == null) return null;
 
-                // Get Stremio Provider ("stremio" field)
-                var stremioProviderField = config.GetType().GetField("stremio");
-                var stremioProvider = stremioProviderField?.GetValue(config);
+                var stremioProvider = GelatoCompatibility.GetStremioProvider(config);
 
                 if (stremioProvider == null) return null;
 
-                // Resolve StremioMediaType by finding the method first
-                var getMetaMethod = stremioProvider.GetType().GetMethods()
-                    .FirstOrDefault(m => m.Name == "GetMetaAsync" && m.GetParameters().Length == 2);
-                
-                if (getMetaMethod == null)
+                var mediaType = GelatoCompatibility.GetMediaType(gelatoPlugin);
+                if (mediaType == null)
                 {
-                     _logger.LogError("[Baklava.SearchMetadata] GetMetaAsync method not found on StremioProvider");
-                     return null;
+                    return null;
                 }
 
-                var paramType = getMetaMethod.GetParameters()[1].ParameterType;
-                var mediaTypeEnumValue = Enum.ToObject(paramType, mediaTypeEnum);
-
-                var task = getMetaMethod.Invoke(stremioProvider, new object[] { id, mediaTypeEnumValue }) as Task;
-                if (task == null) return null;
-
-                await task.ConfigureAwait(false);
-
-                var resultProp = task.GetType().GetProperty("Result");
-                var result = resultProp?.GetValue(task);
-
-                return result;
+                var mediaTypeEnumValue = GelatoCompatibility.ParseMediaType(mediaType, isSeries);
+                return await GelatoCompatibility
+                    .GetMetaAsync(stremioProvider, id, mediaTypeEnumValue)
+                    .ConfigureAwait(false);
             }
             catch (Exception ex)
             {

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Baklava.Helpers;
 using Baklava.Services;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Collections;
@@ -140,6 +141,10 @@ namespace Baklava.Tasks
 
                 progress.Report(100);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[BaklavaSyncTask] Sync task failed");
@@ -151,139 +156,77 @@ namespace Baklava.Tasks
         {
             try
             {
-                // Get scoped Gelato references
                 using var scope = _serviceProvider.CreateScope();
-                
-                // Get Gelato plugin via reflection (avoids direct dependency)
-                var gelatoAssembly = AppDomain.CurrentDomain.GetAssemblies()
-                    .FirstOrDefault(a => a.GetName().Name == "Gelato");
-                    
-                if (gelatoAssembly == null)
+                var gelatoAssembly = GelatoCompatibility.GetAssembly();
+                if (gelatoAssembly is null)
                 {
                     _logger.LogWarning("[BaklavaSyncTask] Gelato assembly not found");
                     return null;
                 }
 
-                var gelatoPluginType = gelatoAssembly.GetType("Gelato.GelatoPlugin");
-                if (gelatoPluginType == null)
+                var gelatoManager = GelatoCompatibility.GetManager(scope.ServiceProvider, gelatoAssembly);
+                var mediaType = GelatoCompatibility.GetMediaType(gelatoAssembly);
+                if (gelatoManager is null || mediaType is null)
                 {
-                    _logger.LogWarning("[BaklavaSyncTask] GelatoPlugin type not found");
+                    _logger.LogWarning("[BaklavaSyncTask] Gelato manager or media type not available");
                     return null;
                 }
 
-                var instanceProp = gelatoPluginType.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                var gelatoPlugin = instanceProp?.GetValue(null);
-                if (gelatoPlugin == null)
+                var isSeries = string.Equals(item.ItemType, "series", StringComparison.OrdinalIgnoreCase);
+                var parentFolder = GelatoCompatibility.GetRootFolder(
+                    gelatoManager,
+                    isSeries,
+                    Guid.Empty);
+                if (parentFolder is null)
                 {
-                    _logger.LogWarning("[BaklavaSyncTask] Gelato plugin not available");
+                    _logger.LogWarning("[BaklavaSyncTask] Gelato root folder not found for {Type}", item.ItemType);
                     return null;
                 }
 
-                var gelatoManager = gelatoPlugin.GetType().GetProperty("Manager")?.GetValue(gelatoPlugin);
-                if (gelatoManager == null)
+                var mediaTypeValue = GelatoCompatibility.ParseMediaType(mediaType, isSeries);
+                object? meta = null;
+                var config = GelatoCompatibility.GetConfig(gelatoAssembly, Guid.Empty);
+                var provider = config is null ? null : GelatoCompatibility.GetStremioProvider(config);
+                if (provider is not null)
                 {
-                    _logger.LogWarning("[BaklavaSyncTask] Gelato manager not available");
-                    return null;
+                    meta = await GelatoCompatibility
+                        .GetMetaAsync(provider, item.ImdbId, mediaTypeValue)
+                        .ConfigureAwait(false);
                 }
 
-                var managerType = gelatoManager.GetType();
-                var metaTypeEnum = managerType.Assembly.GetType("Gelato.StremioMediaType");
-                if (metaTypeEnum == null)
+                meta ??= GelatoCompatibility.CreateMeta(gelatoAssembly, item.ImdbId, mediaTypeValue);
+                var metaType = meta.GetType();
+                if (string.IsNullOrWhiteSpace(metaType.GetProperty("Name")?.GetValue(meta) as string))
                 {
-                    _logger.LogWarning("[BaklavaSyncTask] StremioMediaType not found");
-                    return null;
+                    metaType.GetProperty("Name")?.SetValue(meta, item.Title);
+                }
+                if (string.IsNullOrWhiteSpace(metaType.GetProperty("Poster")?.GetValue(meta) as string))
+                {
+                    metaType.GetProperty("Poster")?.SetValue(meta, item.Poster);
+                }
+                if (string.IsNullOrWhiteSpace(metaType.GetProperty("Background")?.GetValue(meta) as string))
+                {
+                    metaType.GetProperty("Background")?.SetValue(meta, item.Background);
+                }
+                if (string.IsNullOrWhiteSpace(metaType.GetProperty("Description")?.GetValue(meta) as string))
+                {
+                    metaType.GetProperty("Description")?.SetValue(meta, item.Overview);
                 }
 
-                // Get folder path
-                var cfgProp = gelatoPlugin.GetType().GetProperty("Configuration");
-                var cfg = cfgProp?.GetValue(gelatoPlugin);
-                if (cfg == null)
-                {
-                    _logger.LogWarning("[BaklavaSyncTask] Gelato configuration not available");
-                    return null;
-                }
-                
-                var folderPath = item.ItemType == "series" 
-                    ? cfg.GetType().GetProperty("SeriesFolder")?.GetValue(cfg) as string
-                    : cfg.GetType().GetProperty("MovieFolder")?.GetValue(cfg) as string;
-
-                if (string.IsNullOrEmpty(folderPath))
-                {
-                    _logger.LogWarning("[BaklavaSyncTask] Folder path not configured");
-                    return null;
-                }
-
-                // Find parent folder
-                var scopedLibraryManager = scope.ServiceProvider.GetRequiredService<ILibraryManager>();
-                var parentFolder = scopedLibraryManager.GetItemList(new InternalItemsQuery
-                {
-                    Path = folderPath,
-                    Recursive = false,
-                    Limit = 1,
-                    IncludeItemTypes = new[] { BaseItemKind.Folder }
-                }).OfType<Folder>().FirstOrDefault();
-
-                if (parentFolder == null)
-                {
-                    _logger.LogWarning("[BaklavaSyncTask] Parent folder not found: {Path}", folderPath);
-                    return null;
-                }
-
-                // Create StremioMeta object
-                var metaType = managerType.Assembly.GetType("Gelato.StremioMeta");
-                var metaResult = Activator.CreateInstance(metaType!);
-                
-                metaType.GetProperty("Id")?.SetValue(metaResult, item.ImdbId);
-                metaType.GetProperty("Name")?.SetValue(metaResult, item.Title);
-                metaType.GetProperty("Poster")?.SetValue(metaResult, item.Poster);
-                metaType.GetProperty("Background")?.SetValue(metaResult, item.Background);
-                metaType.GetProperty("Description")?.SetValue(metaResult, item.Overview);
-                metaType.GetProperty("ImdbRating")?.SetValue(metaResult, item.Rating);
-                
-                var mediaTypeValue = Enum.Parse(metaTypeEnum, item.ItemType == "series" ? "Series" : "Movie", true);
-                metaType.GetProperty("Type")?.SetValue(metaResult, mediaTypeValue);
-
-                // Clear Videos for series
-                if (item.ItemType == "series")
-                {
-                    metaType.GetProperty("Videos")?.SetValue(metaResult, null);
-                }
-
-                // Call InsertMeta
-                var insertMetaMethod = managerType.GetMethod("InsertMeta");
-                if (insertMetaMethod == null)
-                {
-                    _logger.LogWarning("[BaklavaSyncTask] InsertMeta method not found");
-                    return null;
-                }
-
-                var insertTask = (Task)insertMetaMethod.Invoke(gelatoManager, new object[]
-                {
+                var insertedItem = await GelatoCompatibility.InsertMetaAsync(
+                    gelatoManager,
                     parentFolder,
-                    metaResult,
-                    Guid.Empty,
-                    true,  // allowRemoteRefresh
-                    true,  // refreshItem
-                    false, // queueRefreshItem
-                    cancellationToken
-                });
-
-                await insertTask.ConfigureAwait(false);
-
-                // Extract Item.Id from result
-                var resultTuple = insertTask.GetType().GetProperty("Result")?.GetValue(insertTask);
-                if (resultTuple == null) return null;
-
-                var itemField = resultTuple.GetType().GetField("Item1");
-                var importedItem = itemField?.GetValue(resultTuple);
-
-                if (importedItem != null)
-                {
-                    var idProp = importedItem.GetType().GetProperty("Id");
-                    return idProp?.GetValue(importedItem)?.ToString();
-                }
-
-                return null;
+                    meta,
+                    user: null,
+                    allowRemoteRefresh: true,
+                    refreshItem: true,
+                    queueRefreshItem: false,
+                    cancellationToken).ConfigureAwait(false);
+                return GelatoCompatibility.GetItemId(insertedItem);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {

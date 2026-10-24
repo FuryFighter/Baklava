@@ -19,6 +19,7 @@ namespace Baklava.Api
     /// Controller for managing and serving external subtitles
     /// </summary>
     [ApiController]
+    [Authorize]
     [Route("api/baklava/subtitles")]
     public class SubtitleController : ControllerBase
     {
@@ -88,7 +89,6 @@ namespace Baklava.Api
         /// Proxy/serve external subtitle from cache
         /// </summary>
         [HttpGet("proxy")]
-        [AllowAnonymous] // Allow clients to fetch subtitles without auth (they'll use session token)
         public async Task<ActionResult> ProxySubtitle(
             [FromQuery] string itemId,
             [FromQuery] string? lang,
@@ -214,7 +214,7 @@ namespace Baklava.Api
         /// This matches Podium's endpoint for compatibility
         /// </summary>
         [HttpGet("/api/baklava/Subtitle/vtt")]
-        [AllowAnonymous] // Allow players to fetch without full auth
+        [Authorize(Policy = MediaBrowser.Common.Api.Policies.RequiresElevation)]
         public async Task<ActionResult> GetVttSubtitle([FromQuery] string url)
         {
             if (string.IsNullOrEmpty(url))

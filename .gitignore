@@ -2,6 +2,9 @@
 bin/
 obj/
 publish/
+.build/
+artifacts/
+*:Zone.Identifier
 
 # Visual Studio / Rider
 .vs/

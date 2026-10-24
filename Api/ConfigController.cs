@@ -1,10 +1,13 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using MediaBrowser.Common.Api;
+using System.Threading.Tasks;
 
 namespace Baklava.Api
 {
     [ApiController]
+    [Authorize]
     // Support both the explicit plugin route and the legacy "myplugin" route
     // so the Jellyfin admin UI can find the configuration endpoint regardless
     // of how the client requests it.
@@ -13,14 +16,16 @@ namespace Baklava.Api
     public class ConfigController : ControllerBase
     {
         private readonly ILogger<ConfigController> _logger;
+        private readonly IAuthorizationService _authorization;
 
-        public ConfigController(ILogger<ConfigController> logger)
+        public ConfigController(ILogger<ConfigController> logger, IAuthorizationService authorization)
         {
             _logger = logger;
+            _authorization = authorization;
         }
 
         [HttpGet]
-        public ActionResult<object> GetConfig()
+        public async Task<ActionResult<object>> GetConfig()
         {
             var cfg = Plugin.Instance?.Configuration;
             if (cfg == null) return BadRequest("Configuration not available");
@@ -28,7 +33,7 @@ namespace Baklava.Api
             // Only return the TMDB API key to administrators. Non-admin callers will receive
             // only non-sensitive configuration so we don't leak secrets to user-facing pages.
             var user = HttpContext.User;
-            var isAdmin = user?.IsInRole("Administrator") ?? false;
+            var isAdmin = (await _authorization.AuthorizeAsync(user, null, Policies.RequiresElevation)).Succeeded;
 
             if (isAdmin)
             {
@@ -73,23 +78,11 @@ namespace Baklava.Api
         }
 
         [HttpPut]
-        [Authorize]
+        [Authorize(Policy = Policies.RequiresElevation)]
         public ActionResult SetConfig([FromBody] ConfigDto dto)
         {
             _logger.LogInformation("[ConfigController] PUT request received");
             
-            // Basic admin check
-            var user = HttpContext.User;
-            var isAdmin = user?.IsInRole("Administrator") ?? false;
-            
-            _logger.LogInformation("[ConfigController] User admin check: {IsAdmin}, User: {User}", isAdmin, user?.Identity?.Name ?? "anonymous");
-            
-            if (!isAdmin)
-            {
-                _logger.LogWarning("[ConfigController] PUT rejected - user is not admin");
-                return Forbid();
-            }
-
             var cfg = Plugin.Instance?.Configuration;
             if (cfg == null)
             {

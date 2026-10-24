@@ -184,12 +184,14 @@
 
         const origFetch = window.fetch;
         window.fetch = function (i, init) {
-            if (typeof i === 'string' && (i.includes('/Search') || i.includes('/Items'))) {
-                try {
-                    const u = new URL(i, window.location.origin);
-                    if (patchURL(u)) i = u.toString();
-                } catch {}
-            }
+            try {
+                const rawUrl = i instanceof Request ? i.url : String(i);
+                const u = new URL(rawUrl, window.location.href);
+                if (u.origin === window.location.origin &&
+                    (/\/(Search|Items)(\/|$)/i.test(u.pathname)) && patchURL(u)) {
+                    i = i instanceof Request ? new Request(u.toString(), i) : u.toString();
+                }
+            } catch {}
             return origFetch.call(this, i, init);
         };
     }
